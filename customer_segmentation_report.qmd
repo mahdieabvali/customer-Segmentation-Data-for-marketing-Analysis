@@ -1,0 +1,352 @@
+---
+title: "Customer Segmentation Analysis for Marketing"
+author: "Marketing Analytics Team"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 6
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+    fig-width: 7
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Introduction
+
+Customer segmentation is the process of dividing a customer base into distinct groups that share similar characteristics. Effective segmentation enables marketing teams to tailor strategies, optimise resource allocation, and improve customer lifetime value.
+
+This report analyses customer data using **RFM (Recency, Frequency, Monetary)** modelling and unsupervised machine-learning techniques to identify actionable customer segments.
+
+### Objectives
+
+- Identify distinct customer segments based on purchasing behaviour.
+- Profile each segment to inform targeted marketing campaigns.
+- Quantify the revenue contribution of each segment.
+
+### Notation
+
+Throughout this report the following notation is used:
+
+- Let $\mathcal{C} = \{c_1, c_2, \ldots, c_n\}$ denote the set of $n$ customers.
+- The RFM feature vector for customer $c_i$ is
+
+$$
+\mathbf{x}_i = \begin{pmatrix} R_i \\ F_i \\ M_i \end{pmatrix}, \quad i = 1, \ldots, n
+$$
+
+where $R_i$ is the recency (days since last purchase), $F_i$ is the frequency (number of transactions), and $M_i$ is the monetary value (total spend).
+
+---
+
+## Methodology
+
+### Data Pre-processing
+
+Raw transactional data is cleaned and transformed into one row per customer:
+
+1. **Missing-value imputation** — columns with missing entries are filled with their column median.
+2. **Outlier winsorisation** — values below the $1^{\text{st}}$ percentile or above the $99^{\text{th}}$ percentile are clipped to the respective boundary.
+
+Both steps are implemented in the *Setup and Synthetic Data Generation* code block below.
+
+### Feature Engineering — RFM Scores
+
+Each RFM dimension is discretised into five equal-frequency bins and scored from 1 (least valuable) to 5 (most valuable). The composite RFM score is
+
+$$
+\text{RFM\_Score}_i = w_R R_i^{*} + w_F F_i^{*} + w_M M_i^{*}
+$$
+
+where $R_i^{*}$, $F_i^{*}$, $M_i^{*}$ are the binned scores and $w_R + w_F + w_M = 1$ are analyst-defined weights. The scored features are used for segment profiling, while the standardised raw features are used as input to K-Means clustering.
+
+### Clustering Algorithm
+
+Customer segments are identified with **K-Means** clustering on the standardised RFM features. The optimal number of clusters $k^{*}$ is selected by minimising the within-cluster sum of squares (WCSS), also known as the *inertia*:
+
+$$
+\text{WCSS}(k) = \sum_{j=1}^{k} \sum_{c_i \in S_j} \left\| \mathbf{x}_i - \boldsymbol{\mu}_j \right\|^2
+$$
+
+where $S_j$ is the $j$-th cluster and $\boldsymbol{\mu}_j$ is its centroid. The elbow point of the WCSS curve identifies $k^{*}$.
+
+---
+
+## Data Analysis
+
+### Setup and Synthetic Data Generation
+
+The code block below imports all required libraries and generates a synthetic customer dataset that mirrors a real-world transactional extract.
+
+```{python}
+#| label: setup
+#| code-summary: "Import libraries, generate synthetic data, and pre-process"
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+# ── Reproducibility ────────────────────────────────────────────────────────────
+rng = np.random.default_rng(seed=42)
+
+# ── Synthetic customer dataset ─────────────────────────────────────────────────
+N = 500  # number of customers
+
+recency    = rng.integers(1, 365, size=N)           # days since last purchase
+frequency  = rng.integers(1, 50,  size=N)           # number of transactions
+monetary   = rng.uniform(10, 5000, size=N).round(2) # total spend in £
+
+df = pd.DataFrame({
+    "CustomerID": range(1001, 1001 + N),
+    "Recency":    recency,
+    "Frequency":  frequency,
+    "Monetary":   monetary,
+    "Region":     rng.choice(["North", "South", "East", "West"], size=N),
+    "AgeGroup":   rng.choice(["18-24", "25-34", "35-44", "45-54", "55+"], size=N),
+})
+
+# ── Pre-processing ─────────────────────────────────────────────────────────────
+rfm_cols = ["Recency", "Frequency", "Monetary"]
+
+# 1. Missing-value imputation (median per column)
+df[rfm_cols] = df[rfm_cols].fillna(df[rfm_cols].median())
+
+# 2. Outlier winsorisation (clip to [1st, 99th] percentile)
+for col in rfm_cols:
+    lo, hi = df[col].quantile([0.01, 0.99])
+    df[col] = df[col].clip(lower=lo, upper=hi)
+
+# ── RFM Scoring (1–5 equal-frequency bins) ─────────────────────────────────────
+# Lower recency → better score, so invert the bin order for Recency
+df["R_Score"] = pd.qcut(df["Recency"],  q=5, labels=[5, 4, 3, 2, 1]).astype(int)
+df["F_Score"] = pd.qcut(df["Frequency"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]).astype(int)
+df["M_Score"] = pd.qcut(df["Monetary"].rank(method="first"),  q=5, labels=[1, 2, 3, 4, 5]).astype(int)
+
+# Weighted composite score (equal weights by default)
+W_R, W_F, W_M = 0.33, 0.33, 0.34
+df["RFM_Score"] = W_R * df["R_Score"] + W_F * df["F_Score"] + W_M * df["M_Score"]
+
+print(f"Dataset shape: {df.shape}")
+df.head()
+```
+
+### Summary Statistics
+
+```{python}
+#| label: summary-stats
+#| code-summary: "Descriptive statistics for RFM features"
+
+summary = (
+    df[["Recency", "Frequency", "Monetary"]]
+    .describe()
+    .T
+    .rename(columns={"count": "Count", "mean": "Mean", "std": "Std Dev",
+                     "min": "Min", "25%": "Q1", "50%": "Median",
+                     "75%": "Q3", "max": "Max"})
+    .round(2)
+)
+
+summary
+```
+
+### RFM Distribution Plots
+
+```{python}
+#| label: fig-rfm-distributions
+#| fig-cap: "Distribution of RFM features across all customers"
+#| code-summary: "Histogram + KDE for each RFM dimension"
+
+sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+for ax, col, colour in zip(axes,
+                            ["Recency", "Frequency", "Monetary"],
+                            ["#4C72B0", "#DD8452", "#55A868"]):
+    sns.histplot(df[col], kde=True, ax=ax, color=colour, bins=30)
+    ax.set_title(col)
+    ax.set_xlabel(col)
+    ax.set_ylabel("Count")
+
+fig.suptitle("RFM Feature Distributions", fontsize=14, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+### Elbow Method for Optimal *k*
+
+```{python}
+#| label: fig-elbow
+#| fig-cap: "Elbow curve — WCSS vs. number of clusters"
+#| code-summary: "Standardise features and compute inertia for k = 1..10"
+
+features = ["Recency", "Frequency", "Monetary"]
+X = StandardScaler().fit_transform(df[features])
+
+wcss = []
+k_range = range(1, 11)
+for k in k_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    km.fit(X)
+    wcss.append(km.inertia_)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(k_range, wcss, marker="o", color="#4C72B0", linewidth=2)
+ax.axvline(x=4, color="#DD8452", linestyle="--", label="Selected $k=4$")
+ax.set_xlabel("Number of Clusters ($k$)")
+ax.set_ylabel("WCSS (Inertia)")
+ax.set_title("Elbow Method — Optimal Number of Clusters")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+### K-Means Clustering
+
+```{python}
+#| label: clustering
+#| code-summary: "Fit K-Means with k=4 and assign segment labels"
+
+K_OPTIMAL = 4
+km_final = KMeans(n_clusters=K_OPTIMAL, random_state=42, n_init=10)
+df["Cluster"] = km_final.fit_predict(X)
+
+# Human-readable segment names based on centroid profiles
+segment_map = {
+    df.groupby("Cluster")["Monetary"].mean().idxmax():  "High-Value",
+    df.groupby("Cluster")["Recency"].mean().idxmin():   "Recent Buyers",
+    df.groupby("Cluster")["Frequency"].mean().idxmax(): "Loyal Customers",
+}
+# Remaining cluster labelled "At-Risk"
+for c in range(K_OPTIMAL):
+    if c not in segment_map:
+        segment_map[c] = "At-Risk"
+
+df["Segment"] = df["Cluster"].map(segment_map)
+df["Segment"].value_counts()
+```
+
+### Segment Profiles
+
+```{python}
+#| label: tbl-segment-profiles
+#| tbl-cap: "Mean RFM values per customer segment"
+#| code-summary: "Compute per-segment RFM means"
+
+profile = (
+    df.groupby("Segment")[["Recency", "Frequency", "Monetary"]]
+    .mean()
+    .round(2)
+    .rename(columns={
+        "Recency":   "Avg Recency (days)",
+        "Frequency": "Avg Frequency",
+        "Monetary":  "Avg Monetary (£)",
+    })
+    .sort_values("Avg Monetary (£)", ascending=False)
+)
+
+profile
+```
+
+### Segment Size and Revenue Contribution
+
+```{python}
+#| label: fig-segment-summary
+#| fig-cap: "Customer count and total revenue by segment"
+#| code-summary: "Side-by-side bar charts for segment size and revenue share"
+
+seg_stats = (
+    df.groupby("Segment")
+    .agg(CustomerCount=("CustomerID", "count"),
+         TotalRevenue=("Monetary", "sum"))
+    .sort_values("TotalRevenue", ascending=False)
+    .reset_index()
+)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+# Customer count
+sns.barplot(data=seg_stats, x="Segment", y="CustomerCount",
+            palette="muted", ax=ax1)
+ax1.set_title("Customer Count per Segment")
+ax1.set_xlabel("Segment")
+ax1.set_ylabel("Number of Customers")
+
+# Total revenue
+sns.barplot(data=seg_stats, x="Segment", y="TotalRevenue",
+            palette="muted", ax=ax2)
+ax2.yaxis.set_major_formatter(mtick.FuncFormatter(
+    lambda x, _: f"£{x:,.0f}"))
+ax2.set_title("Total Revenue per Segment")
+ax2.set_xlabel("Segment")
+ax2.set_ylabel("Total Revenue (£)")
+
+fig.suptitle("Segment Performance Overview", fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+```
+
+### Pairplot of RFM Features by Segment
+
+```{python}
+#| label: fig-pairplot
+#| fig-cap: "Pairwise relationships between RFM features, coloured by segment"
+#| code-summary: "Seaborn pairplot"
+
+g = sns.pairplot(
+    df[["Recency", "Frequency", "Monetary", "Segment"]],
+    hue="Segment",
+    plot_kws={"alpha": 0.5, "s": 20},
+    diag_kind="kde",
+    corner=True,
+)
+g.figure.suptitle("RFM Pairplot by Segment", y=1.02, fontsize=14, fontweight="bold")
+plt.show()
+```
+
+---
+
+## Conclusion
+
+### Key Findings
+
+| Segment | Characteristics | Recommended Action |
+|---|---|---|
+| **High-Value** | High spend, moderate recency | Loyalty rewards, exclusive offers |
+| **Loyal Customers** | High frequency, moderate spend | Upsell premium products |
+| **Recent Buyers** | Very recent, low history | Onboarding sequences, second-purchase incentives |
+| **At-Risk** | Low recency and frequency | Win-back campaigns, discount vouchers |
+
+### Limitations
+
+- This analysis uses **synthetic data**; replace with production data from the CRM/data warehouse before acting on results.
+- K-Means assumes spherical clusters of similar size. Alternative algorithms (DBSCAN, Gaussian Mixture Models) may be more appropriate for non-Euclidean or irregularly shaped clusters.
+- Segment stability should be validated across multiple time windows before deployment.
+
+### Next Steps
+
+1. Integrate live transactional data and schedule automated monthly refresh.
+2. Evaluate alternative clustering algorithms and compare silhouette scores.
+3. A/B test marketing interventions for each segment and track uplift in conversion rate and revenue.
+4. Extend the model with additional behavioural features (browsing data, support interactions).
+
+---
+
+*Report generated with [Quarto](https://quarto.org) · Python `{python} import sys; sys.version`*
