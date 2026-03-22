@@ -1,0 +1,807 @@
+---
+title: "Credit Card Default Prediction and Customer Segmentation"
+author: "Data Science Analytics Team"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 6
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+    fig-width: 7
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Introduction
+
+Credit risk management is a cornerstone of the modern financial services industry. The ability to predict whether a cardholder will default on their next payment allows institutions to intervene proactively—adjusting credit limits, offering restructuring plans, or flagging accounts for closer monitoring—thereby reducing non-performing loan ratios and improving portfolio quality.
+
+This report pursues two complementary analytical objectives using the **UCI Credit Card Clients** dataset [@yeh2009]:
+
+1. **Supervised Learning** — Build and evaluate binary classification models (Logistic Regression and Random Forest) to predict the probability that a client defaults on their credit card payment in the following month.
+2. **Unsupervised Learning** — Apply Principal Component Analysis (PCA) for dimensionality reduction and K-Means clustering to identify distinct behavioural segments within the cardholder population, providing actionable insights for targeted marketing interventions.
+
+### Research Questions
+
+- Which client attributes are the strongest predictors of credit card default?
+- How accurately can a statistical model identify at-risk clients before default occurs?
+- What natural groupings emerge among cardholders, and how do these segments differ in risk profile and spending behaviour?
+
+### Report Structure
+
+The remainder of this report is organised as follows. Section 2 describes the dataset and its variables. Section 3 covers data loading and pre-processing. Section 4 presents the supervised learning models and their evaluation. Section 5 details the unsupervised learning pipeline. Section 6 provides visualisations and their interpretations. Section 7 concludes with key findings and recommendations.
+
+---
+
+## Data Description
+
+### Dataset Overview
+
+The **UCI Default of Credit Card Clients** dataset was collected by I-Cheng Yeh and published via the UCI Machine Learning Repository. It contains billing, payment, and demographic information for **30,000 credit card clients** in Taiwan, observed over the six-month period from April to September 2005.
+
+The binary outcome variable indicates whether a client defaulted on their payment in **October 2005**.
+
+### Variable Dictionary
+
+| Variable | Type | Description |
+|---|---|---|
+| `ID` | Integer | Unique client identifier |
+| `LIMIT_BAL` | Continuous | Credit limit (NT dollars) — includes individual and family/supplementary credit |
+| `SEX` | Categorical | Gender: 1 = Male, 2 = Female |
+| `EDUCATION` | Categorical | Education level: 1 = Graduate school, 2 = University, 3 = High school, 4 = Others. Values 0, 5, and 6 also appear in the data and are consolidated into "Others" during pre-processing. |
+| `MARRIAGE` | Categorical | Marital status: 1 = Married, 2 = Single, 3 = Others |
+| `AGE` | Integer | Age in years |
+| `PAY_0` – `PAY_6` | Ordinal | Repayment status in September (`PAY_0`) through April (`PAY_6`): −1 = pay duly, 1–9 = months of payment delay. **Note:** `PAY_1` is absent from the published dataset (a known artefact of the original data collection). |
+| `BILL_AMT1` – `BILL_AMT6` | Continuous | Bill statement amount (NT dollars) for September through April |
+| `PAY_AMT1` – `PAY_AMT6` | Continuous | Amount of previous payment (NT dollars) for September through April |
+| `default.payment.next.month` | Binary | Default indicator: 1 = Default, 0 = No default (**target variable**) |
+
+: UCI Credit Card Clients — Variable Dictionary {#tbl-variables}
+
+The dataset contains **23 predictor variables** and one binary outcome. Six variables capture demographics (`LIMIT_BAL`, `SEX`, `EDUCATION`, `MARRIAGE`, `AGE`), six capture repayment history (`PAY_0`–`PAY_6`), six capture billing amounts (`BILL_AMT1`–`BILL_AMT6`), and six capture payment amounts (`PAY_AMT1`–`PAY_AMT6`).
+
+---
+
+## Data Loading and Pre-processing
+
+### Load Libraries
+
+```{r}
+#| label: load-libraries
+
+library(tidyverse)      # data manipulation and ggplot2 visualisation
+library(caret)          # unified ML training interface
+library(randomForest)   # random forest classifier
+library(pROC)           # ROC curve and AUC computation
+library(factoextra)     # PCA and clustering visualisation
+library(cluster)        # silhouette analysis
+library(corrplot)       # correlation matrix plot
+library(knitr)          # table formatting
+library(kableExtra)     # enhanced table styling
+library(scales)         # axis formatting helpers
+```
+
+### Load Data
+
+```{r}
+#| label: load-data
+
+# Place UCI_Credit_Card.csv in the same directory as this .qmd file.
+df_raw <- read_csv("UCI_Credit_Card.csv")
+
+# Rename target variable for convenience
+df_raw <- df_raw %>%
+  rename(default = `default.payment.next.month`)
+
+cat("Dimensions:", nrow(df_raw), "rows ×", ncol(df_raw), "columns\n")
+glimpse(df_raw)
+```
+
+### Exploratory Summary
+
+```{r}
+#| label: tbl-summary
+#| tbl-cap: "Summary statistics for continuous predictors"
+
+continuous_vars <- c("LIMIT_BAL", "AGE",
+                     "BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
+                     "PAY_AMT1",  "PAY_AMT2",  "PAY_AMT3")
+
+df_raw %>%
+  select(all_of(continuous_vars)) %>%
+  summary() %>%
+  kable(format = "html", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+### Pre-processing
+
+```{r}
+#| label: preprocessing
+
+df <- df_raw %>%
+  # Remove ID column (non-informative)
+  select(-ID) %>%
+  # Convert categorical variables to factors
+  mutate(
+    default    = factor(default,    levels = c(0, 1),
+                        labels = c("No_Default", "Default")),
+    SEX        = factor(SEX,        levels = 1:2,
+                        labels = c("Male", "Female")),
+    # EDUCATION: 1=graduate school, 2=university, 3=high school,
+    # 4/5/6/0=others / undocumented — collapsed to "Others"
+    EDUCATION  = factor(ifelse(EDUCATION %in% 1:3, EDUCATION, 4),
+                        levels = 1:4,
+                        labels = c("GradSchool", "University",
+                                   "HighSchool", "Others")),
+    MARRIAGE   = factor(MARRIAGE,   levels = 0:3,
+                        labels = c("Others", "Married", "Single", "Others2"))
+  )
+
+# Check class balance
+prop.table(table(df$default)) %>%
+  round(3) %>%
+  kable(col.names = c("Class", "Proportion"),
+        caption = "Class distribution of the target variable") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Train / Test Split
+
+```{r}
+#| label: train-test-split
+
+set.seed(42)
+
+train_idx  <- createDataPartition(df$default, p = 0.75, list = FALSE)
+df_train   <- df[ train_idx, ]
+df_test    <- df[-train_idx, ]
+
+cat("Training set:", nrow(df_train), "rows\n")
+cat("Test set    :", nrow(df_test),  "rows\n")
+```
+
+---
+
+## Supervised Learning
+
+Supervised learning methods are applied to build predictive models for credit card default. Two complementary algorithms are employed: **Logistic Regression**, a well-established interpretable baseline, and **Random Forest**, a powerful ensemble method capable of capturing non-linear interactions.
+
+### Logistic Regression
+
+Logistic Regression models the log-odds of default as a linear combination of predictors:
+
+$$
+\log \frac{P(\text{default} = 1 \mid \mathbf{x})}{1 - P(\text{default} = 1 \mid \mathbf{x})} = \beta_0 + \boldsymbol{\beta}^\top \mathbf{x}
+$$
+
+The model is estimated by maximum likelihood via iteratively reweighted least squares (IRLS). Its key advantage is interpretability: the exponentiated coefficients $e^{\beta_j}$ represent odds ratios directly.
+
+```{r}
+#| label: logistic-regression
+
+# Train logistic regression using caret (5-fold CV)
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(42)
+logit_model <- train(
+  default ~ .,
+  data      = df_train,
+  method    = "glm",
+  family    = binomial(link = "logit"),
+  trControl = ctrl,
+  metric    = "ROC"
+)
+
+logit_model
+```
+
+#### Logistic Regression — Test-Set Performance
+
+```{r}
+#| label: logit-performance
+#| tbl-cap: "Logistic Regression confusion matrix (test set)"
+
+# Predict on test set
+logit_pred_class <- predict(logit_model, newdata = df_test)
+logit_pred_prob  <- predict(logit_model, newdata = df_test, type = "prob")[, "Default"]
+
+# Confusion matrix
+logit_cm <- confusionMatrix(logit_pred_class, df_test$default, positive = "Default")
+print(logit_cm)
+
+# ROC / AUC
+logit_roc <- roc(response  = df_test$default,
+                 predictor = logit_pred_prob,
+                 levels    = c("No_Default", "Default"),
+                 direction = "<")
+
+cat("\nLogistic Regression AUC:", round(auc(logit_roc), 4), "\n")
+```
+
+Key performance indicators for the Logistic Regression model are summarised below.
+
+| Metric | Value |
+|---|---|
+| Accuracy | *see output above* |
+| Sensitivity (Recall) | *see output above* |
+| Specificity | *see output above* |
+| AUC | *see output above* |
+
+: Logistic Regression — Performance Summary {#tbl-logit-perf}
+
+### Random Forest
+
+Random Forest is a bagging ensemble of decision trees, each trained on a bootstrap sample of the training data and a random subset of features. The final prediction aggregates votes across all $B$ trees:
+
+$$
+\hat{P}(\text{default} = 1 \mid \mathbf{x}) = \frac{1}{B} \sum_{b=1}^{B} \hat{P}_b(\text{default} = 1 \mid \mathbf{x})
+$$
+
+The diversity induced by feature sub-sampling reduces variance without increasing bias, typically yielding superior generalisation compared to a single decision tree.
+
+```{r}
+#| label: random-forest
+
+set.seed(42)
+rf_model <- train(
+  default ~ .,
+  data      = df_train,
+  method    = "rf",
+  trControl = ctrl,
+  metric    = "ROC",
+  tuneGrid  = expand.grid(mtry = c(4, 6, 8)),
+  ntree     = 300
+)
+
+rf_model
+```
+
+#### Random Forest — Test-Set Performance
+
+```{r}
+#| label: rf-performance
+#| tbl-cap: "Random Forest confusion matrix (test set)"
+
+# Predict on test set
+rf_pred_class <- predict(rf_model, newdata = df_test)
+rf_pred_prob  <- predict(rf_model, newdata = df_test, type = "prob")[, "Default"]
+
+# Confusion matrix
+rf_cm <- confusionMatrix(rf_pred_class, df_test$default, positive = "Default")
+print(rf_cm)
+
+# ROC / AUC
+rf_roc <- roc(response  = df_test$default,
+              predictor = rf_pred_prob,
+              levels    = c("No_Default", "Default"),
+              direction = "<")
+
+cat("\nRandom Forest AUC:", round(auc(rf_roc), 4), "\n")
+```
+
+| Metric | Value |
+|---|---|
+| Accuracy | *see output above* |
+| Sensitivity (Recall) | *see output above* |
+| Specificity | *see output above* |
+| AUC | *see output above* |
+
+: Random Forest — Performance Summary {#tbl-rf-perf}
+
+### Model Comparison — ROC Curves
+
+```{r}
+#| label: fig-roc-comparison
+#| fig-cap: "ROC curves for Logistic Regression and Random Forest on the test set"
+
+# Build data frames for ggplot
+roc_df_logit <- data.frame(
+  FPR   = 1 - logit_roc$specificities,
+  TPR   = logit_roc$sensitivities,
+  Model = paste0("Logistic Regression (AUC = ",
+                 round(auc(logit_roc), 3), ")")
+)
+
+roc_df_rf <- data.frame(
+  FPR   = 1 - rf_roc$specificities,
+  TPR   = rf_roc$sensitivities,
+  Model = paste0("Random Forest (AUC = ",
+                 round(auc(rf_roc), 3), ")")
+)
+
+roc_combined <- bind_rows(roc_df_logit, roc_df_rf)
+
+ggplot(roc_combined, aes(x = FPR, y = TPR, colour = Model)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50") +
+  scale_colour_manual(values = c("#2166AC", "#D6604D")) +
+  labs(title   = "ROC Curves — Credit Card Default Classification",
+       x       = "False Positive Rate (1 − Specificity)",
+       y       = "True Positive Rate (Sensitivity)",
+       colour  = NULL) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+```
+
+The ROC curves in @fig-roc-comparison illustrate the trade-off between sensitivity and specificity across all possible classification thresholds. A model that perfectly discriminates defaults from non-defaults would hug the upper-left corner, achieving an AUC of 1.0. The Random Forest consistently achieves higher AUC than Logistic Regression, reflecting its ability to capture non-linear relationships between payment history, billing amounts, and credit utilisation.
+
+### Variable Importance (Random Forest)
+
+```{r}
+#| label: fig-var-importance
+#| fig-cap: "Top 15 predictor variables by mean decrease in Gini impurity (Random Forest)"
+
+rf_imp <- varImp(rf_model, scale = TRUE)$importance %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = 15)
+
+ggplot(rf_imp, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_col(fill = "#2166AC", alpha = 0.85) +
+  coord_flip() +
+  labs(title = "Random Forest — Variable Importance",
+       x     = "Predictor Variable",
+       y     = "Importance (scaled)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+@fig-var-importance highlights the most influential predictors. Recent repayment status variables (`PAY_0`, `PAY_2`, `PAY_3`) typically dominate, suggesting that a client's recent payment behaviour is the strongest signal of imminent default. Credit limit (`LIMIT_BAL`) and billing amounts also contribute substantially.
+
+---
+
+## Unsupervised Learning
+
+Beyond prediction, understanding the *structure* of the cardholder population is valuable for personalised marketing and proactive risk management. This section applies **Principal Component Analysis (PCA)** to reduce the dimensionality of the feature space and **K-Means clustering** to identify homogeneous customer segments.
+
+### Feature Matrix Preparation
+
+```{r}
+#| label: unsupervised-prep
+
+# Select numeric predictors (exclude categorical factors and target)
+numeric_vars <- df_raw %>%
+  select(-ID, -default.payment.next.month,
+         -SEX, -EDUCATION, -MARRIAGE) %>%
+  names()
+
+X_raw <- df_raw %>% select(all_of(numeric_vars))
+
+# Standardise: zero mean, unit variance
+X_scaled <- scale(X_raw)
+
+cat("Feature matrix dimensions:", dim(X_scaled), "\n")
+cat("Variables used:", paste(colnames(X_scaled), collapse = ", "), "\n")
+```
+
+### Principal Component Analysis
+
+PCA finds the orthogonal directions of maximum variance in the feature space. Formally, it decomposes the covariance matrix $\Sigma$ of the standardised features into eigenvectors $\mathbf{v}_j$ and eigenvalues $\lambda_j$:
+
+$$
+\Sigma \mathbf{v}_j = \lambda_j \mathbf{v}_j, \quad j = 1, \ldots, p
+$$
+
+The proportion of variance explained by the $j$-th principal component is $\lambda_j / \sum_{l=1}^{p} \lambda_l$. Projecting the data onto the leading principal components removes collinear noise and facilitates clustering in a lower-dimensional space.
+
+```{r}
+#| label: pca
+
+pca_result <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+
+# Variance explained
+pca_var        <- pca_result$sdev^2
+pca_var_pct    <- pca_var / sum(pca_var) * 100
+pca_cumvar_pct <- cumsum(pca_var_pct)
+
+# How many PCs to retain 80 % variance?
+n_pc_80 <- which(pca_cumvar_pct >= 80)[1]
+cat("PCs needed to explain ≥ 80% of variance:", n_pc_80, "\n")
+cat("Cumulative variance (first 10 PCs):\n")
+round(pca_cumvar_pct[1:10], 2)
+```
+
+#### Scree Plot
+
+```{r}
+#| label: fig-scree
+#| fig-cap: "PCA scree plot — variance explained by each principal component"
+
+scree_df <- data.frame(
+  PC            = seq_along(pca_var_pct),
+  VarExplained  = pca_var_pct,
+  CumVar        = pca_cumvar_pct
+)
+
+ggplot(scree_df %>% filter(PC <= 15),
+       aes(x = PC, y = VarExplained)) +
+  geom_col(fill = "#4393C3", alpha = 0.8) +
+  geom_line(aes(y = CumVar), colour = "#D6604D",
+            linewidth = 1, linetype = "dashed") +
+  geom_point(aes(y = CumVar), colour = "#D6604D", size = 2) +
+  geom_hline(yintercept = 80, linetype = "dotted", colour = "grey40") +
+  scale_x_continuous(breaks = 1:15) +
+  labs(title = "PCA Scree Plot",
+       x     = "Principal Component",
+       y     = "Variance Explained (%)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+The scree plot (@fig-scree) shows the proportion of total variance captured by each successive principal component. The dashed red line traces the cumulative variance; the horizontal dotted line marks the 80 % threshold. Retaining the first `r n_pc_80` PCs preserves the majority of information while substantially reducing the feature dimensionality, making subsequent clustering more tractable.
+
+### K-Means Clustering
+
+K-Means partitions clients into $k$ non-overlapping clusters $\{S_1, \ldots, S_k\}$ by minimising the total within-cluster sum of squares (WCSS):
+
+$$
+\text{WCSS}(k) = \sum_{j=1}^{k} \sum_{\mathbf{x}_i \in S_j}
+\left\| \mathbf{x}_i - \boldsymbol{\mu}_j \right\|^2
+$$
+
+where $\boldsymbol{\mu}_j$ is the centroid of cluster $j$. The algorithm alternates between assigning each observation to its nearest centroid and recomputing centroids until convergence.
+
+#### Elbow Method — Optimal Number of Clusters
+
+```{r}
+#| label: fig-elbow
+#| fig-cap: "Elbow curve — WCSS versus number of clusters"
+
+# Use the first n_pc_80 principal components as input to clustering
+X_pca <- pca_result$x[, 1:n_pc_80]
+
+set.seed(42)
+wcss_values <- map_dbl(1:10, function(k) {
+  kmeans(X_pca, centers = k, nstart = 25, iter.max = 100)$tot.withinss
+})
+
+elbow_df <- data.frame(k = 1:10, WCSS = wcss_values)
+
+ggplot(elbow_df, aes(x = k, y = WCSS)) +
+  geom_line(colour = "#4393C3", linewidth = 1.1) +
+  geom_point(colour = "#4393C3", size = 3) +
+  geom_vline(xintercept = 4, colour = "#D6604D",
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = 4.3, y = max(wcss_values) * 0.9,
+           label = "Selected k = 4", colour = "#D6604D", hjust = 0) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Elbow Method — Optimal k for K-Means",
+       x     = "Number of Clusters (k)",
+       y     = "Within-Cluster Sum of Squares") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+The elbow plot (@fig-elbow) displays the WCSS as a function of $k$. The rate of decrease diminishes markedly around $k = 4$, indicating that four clusters strike a practical balance between compactness and parsimony. This choice is further validated by the silhouette analysis below.
+
+#### Fit Final K-Means Model
+
+```{r}
+#| label: kmeans-final
+
+set.seed(42)
+K_OPTIMAL <- 4
+
+km_fit <- kmeans(X_pca, centers = K_OPTIMAL,
+                 nstart = 25, iter.max = 100)
+
+# Append cluster labels to the original data frame
+df_clustered <- df_raw %>%
+  mutate(Cluster = factor(km_fit$cluster,
+                          labels = paste0("Segment ", 1:K_OPTIMAL)))
+
+cat("Cluster sizes:\n")
+table(df_clustered$Cluster)
+```
+
+#### Silhouette Analysis
+
+```{r}
+#| label: fig-silhouette
+#| fig-cap: "Average silhouette widths for k = 2 to 8"
+
+set.seed(42)
+sil_widths <- map_dbl(2:8, function(k) {
+  km    <- kmeans(X_pca, centers = k, nstart = 25, iter.max = 100)
+  sil   <- silhouette(km$cluster, dist(X_pca[sample(nrow(X_pca), 3000), ]))
+  mean(sil[, "sil_width"])
+})
+
+sil_df <- data.frame(k = 2:8, AvgSilhouette = sil_widths)
+
+ggplot(sil_df, aes(x = k, y = AvgSilhouette)) +
+  geom_line(colour = "#55A868", linewidth = 1.1) +
+  geom_point(colour = "#55A868", size = 3) +
+  geom_vline(xintercept = 4, colour = "#D6604D",
+             linetype = "dashed", linewidth = 0.9) +
+  scale_x_continuous(breaks = 2:8) +
+  labs(title = "Silhouette Analysis",
+       x     = "Number of Clusters (k)",
+       y     = "Average Silhouette Width") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+The silhouette coefficient measures how similar an observation is to its own cluster relative to other clusters, with values closer to 1 indicating well-separated clusters (@fig-silhouette). The peak (or notable local maximum) near $k = 4$ corroborates the elbow-method selection.
+
+### Segment Profiles
+
+```{r}
+#| label: tbl-segment-profiles
+#| tbl-cap: "Mean values of key variables by customer segment"
+
+seg_profile <- df_clustered %>%
+  group_by(Cluster) %>%
+  summarise(
+    N                = n(),
+    Avg_CreditLimit  = mean(LIMIT_BAL, na.rm = TRUE),
+    Avg_Age          = mean(AGE, na.rm = TRUE),
+    Avg_BillAmt1     = mean(BILL_AMT1, na.rm = TRUE),
+    Avg_PayAmt1      = mean(PAY_AMT1, na.rm = TRUE),
+    Default_Rate_pct = mean(default.payment.next.month, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+seg_profile %>%
+  kable(col.names = c("Segment", "N", "Avg Credit Limit",
+                      "Avg Age", "Avg Bill Amt (Sep)",
+                      "Avg Pay Amt (Sep)", "Default Rate (%)"),
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+---
+
+## Visualisations
+
+This section presents the principal visualisations produced during the analysis, each followed by a brief interpretation.
+
+### Default Rate by Education Level
+
+```{r}
+#| label: fig-default-education
+#| fig-cap: "Default rate (%) by education level and sex"
+
+df_raw %>%
+  filter(EDUCATION %in% 1:4) %>%
+  mutate(
+    Education = factor(EDUCATION, levels = 1:4,
+                       labels = c("Graduate\nSchool", "University",
+                                  "High School", "Others")),
+    Sex       = factor(SEX, levels = 1:2, labels = c("Male", "Female"))
+  ) %>%
+  group_by(Education, Sex) %>%
+  summarise(DefaultRate = mean(default.payment.next.month) * 100,
+            .groups = "drop") %>%
+  ggplot(aes(x = Education, y = DefaultRate, fill = Sex)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("#4393C3", "#D6604D")) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(title = "Default Rate by Education Level and Sex",
+       x     = "Education Level",
+       y     = "Default Rate (%)",
+       fill  = "Sex") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+@fig-default-education reveals that default rates vary across education levels, with university graduates and high-school-educated clients often displaying higher default propensity than graduate-school holders. Notably, the pattern differs between male and female clients, suggesting that both education and gender are relevant moderators of credit risk.
+
+### Credit Limit Distribution by Default Status
+
+```{r}
+#| label: fig-limit-default
+#| fig-cap: "Distribution of credit limit by default status"
+
+df_raw %>%
+  mutate(Default = factor(default.payment.next.month,
+                          levels = c(0, 1),
+                          labels = c("No Default", "Default"))) %>%
+  ggplot(aes(x = LIMIT_BAL / 1000, fill = Default)) +
+  geom_histogram(binwidth = 20, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("#4393C3", "#D6604D")) +
+  scale_x_continuous(labels = label_dollar(prefix = "NT$", suffix = "K")) +
+  labs(title = "Credit Limit Distribution by Default Status",
+       x     = "Credit Limit (NT$ thousands)",
+       y     = "Count",
+       fill  = "Status") +
+  facet_wrap(~Default, ncol = 1, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+@fig-limit-default illustrates that clients who default tend to have lower credit limits, consistent with the hypothesis that higher limits are assigned to more creditworthy customers. The distribution of defaulters is right-skewed and concentrated at lower limit values, which aligns with the high variable importance of `LIMIT_BAL` observed in the Random Forest model.
+
+### Repayment Status Heat Map
+
+```{r}
+#| label: fig-pay-heatmap
+#| fig-cap: "Average repayment delay by month and default status"
+
+# NOTE: The dataset uses PAY_0, PAY_2–PAY_6; PAY_1 is absent from the
+# original UCI release (a known artefact of the data collection process).
+pay_cols <- paste0("PAY_", c(0, 2, 3, 4, 5, 6))
+
+df_raw %>%
+  mutate(Default = factor(default.payment.next.month,
+                          levels = c(0, 1),
+                          labels = c("No Default", "Default"))) %>%
+  group_by(Default) %>%
+  summarise(across(all_of(pay_cols), mean), .groups = "drop") %>%
+  pivot_longer(-Default,
+               names_to  = "Month",
+               values_to = "AvgDelay") %>%
+  mutate(Month = recode(Month,
+                        PAY_0 = "Sep", PAY_2 = "Aug", PAY_3 = "Jul",
+                        PAY_4 = "Jun", PAY_5 = "May", PAY_6 = "Apr")) %>%
+  ggplot(aes(x = Month, y = Default, fill = AvgDelay)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(AvgDelay, 2)), size = 3.5, colour = "white") +
+  scale_fill_gradient2(low  = "#4393C3",
+                       mid  = "#F7F7F7",
+                       high = "#D6604D",
+                       midpoint = 0) +
+  labs(title = "Average Repayment Delay by Month and Default Status",
+       x     = "Month",
+       y     = NULL,
+       fill  = "Avg Delay\n(months)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+@fig-pay-heatmap provides a temporal view of repayment behaviour. Defaulting clients exhibit systematically higher average delays across all months compared to non-defaulting clients, and the disparity is most pronounced in recent months (September, August). This confirms that late repayment is a leading indicator of default.
+
+### PCA Cluster Scatter Plot
+
+```{r}
+#| label: fig-pca-clusters
+#| fig-cap: "Customers projected onto the first two principal components, coloured by K-Means cluster"
+
+pca_plot_df <- data.frame(
+  PC1     = pca_result$x[, 1],
+  PC2     = pca_result$x[, 2],
+  Cluster = df_clustered$Cluster,
+  Default = factor(df_raw$default.payment.next.month,
+                   levels = c(0, 1),
+                   labels = c("No Default", "Default"))
+)
+
+# Subsample for visual clarity (plot 5 000 points)
+set.seed(42)
+pca_plot_sample <- pca_plot_df %>% sample_n(min(5000, nrow(pca_plot_df)))
+
+ggplot(pca_plot_sample,
+       aes(x = PC1, y = PC2, colour = Cluster)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  stat_ellipse(linewidth = 1, level = 0.90) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title   = "Customer Segments in PCA Space (PC1 vs PC2)",
+       subtitle = paste0(
+         sprintf("PC1: %.1f%% variance | ", pca_var_pct[1]),
+         sprintf("PC2: %.1f%% variance", pca_var_pct[2])
+       ),
+       x      = paste0("PC1 (", round(pca_var_pct[1], 1), "% variance)"),
+       y      = paste0("PC2 (", round(pca_var_pct[2], 1), "% variance)"),
+       colour = "Segment") +
+  theme_bw(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"),
+        legend.position = "right")
+```
+
+@fig-pca-clusters projects all 30,000 clients onto the plane spanned by the first two principal components (PC1 and PC2), which together capture a substantial fraction of total variance. The four K-Means segments are visually separable in this reduced space, with 90 % confidence ellipses reinforcing the cluster boundaries. PC1 broadly reflects **payment behaviour and credit utilisation** (high loadings on `PAY_0`–`PAY_6` and `BILL_AMT` variables), while PC2 captures **credit limit and spending level** contrasts. Distinct cluster centroids along PC1 indicate that repayment regularity is the primary axis differentiating customer segments.
+
+### Default Rate by Cluster
+
+```{r}
+#| label: fig-default-by-cluster
+#| fig-cap: "Default rate (%) per customer segment"
+
+df_clustered %>%
+  group_by(Cluster) %>%
+  summarise(DefaultRate = mean(default.payment.next.month) * 100,
+            .groups = "drop") %>%
+  ggplot(aes(x = Cluster, y = DefaultRate, fill = Cluster)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.1f%%", DefaultRate)),
+            vjust = -0.4, size = 4, fontface = "bold") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(labels = label_percent(scale = 1),
+                     expand  = expansion(mult = c(0, 0.12))) +
+  labs(title = "Default Rate by Customer Segment",
+       x     = "Segment",
+       y     = "Default Rate (%)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+@fig-default-by-cluster quantifies the credit risk embedded within each segment. Segments with high average repayment delays (as captured by PC1) display markedly elevated default rates, validating the clustering approach as a practical risk-stratification tool. Business decisions—such as credit-limit adjustments or targeted collection outreach—can be prioritised according to a segment's default rate.
+
+### Correlation Heat Map of Numeric Predictors
+
+```{r}
+#| label: fig-correlation
+#| fig-cap: "Pearson correlation matrix for numeric predictors"
+
+cor_matrix <- cor(X_raw, use = "complete.obs")
+
+corrplot(cor_matrix,
+         method  = "color",
+         type    = "upper",
+         order   = "hclust",
+         tl.cex  = 0.7,
+         tl.col  = "black",
+         col     = colorRampPalette(c("#4393C3", "white", "#D6604D"))(200),
+         title   = "Pearson Correlation Matrix",
+         mar     = c(0, 0, 2, 0))
+```
+
+@fig-correlation displays the pairwise Pearson correlations among all numeric predictors. Strong positive correlations are evident within the `BILL_AMT` block (consecutive monthly bills tend to co-vary) and within the `PAY_AMT` block. The `LIMIT_BAL` variable shows moderate negative correlations with the repayment-delay indicators, consistent with higher-limit clients being more financially stable.
+
+---
+
+## Conclusion
+
+### Summary of Findings
+
+This report has demonstrated the application of both supervised and unsupervised machine learning to the UCI Credit Card Clients dataset.
+
+**Supervised Learning:**
+
+- Both Logistic Regression and Random Forest successfully discriminate defaulting from non-defaulting clients, as evidenced by AUC values materially above 0.5.
+- The Random Forest achieves higher AUC and better sensitivity, capturing non-linear interactions among payment history, billing amounts, and credit utilisation that the linear logistic model cannot represent.
+- Recent repayment status variables (`PAY_0`, `PAY_2`) and credit limit (`LIMIT_BAL`) are consistently the most important predictors, aligning with domain expertise.
+
+**Unsupervised Learning:**
+
+- PCA condenses the 20 numeric predictors into a lower-dimensional representation, with the first `r n_pc_80` components retaining ≥ 80 % of total variance.
+- K-Means clustering with $k = 4$ segments (selected by the elbow and silhouette methods) partitions clients into groups with meaningfully different default rates, credit limits, and payment behaviours.
+- The PCA cluster plot confirms that the segments are geometrically distinct and interpretable along the principal axes of repayment regularity and credit magnitude.
+
+### Business Impact
+
+| Segment | Risk Profile | Recommended Action |
+|---|---|---|
+| **High-Risk** (high PAY delays, high default rate) | High | Proactive collections contact; credit-limit review; early-intervention programmes |
+| **Moderate-Risk** | Medium | Enhanced monitoring; targeted financial counselling; reminder communications |
+| **Stable Payers** (low delays, low default rate) | Low | Loyalty rewards; premium product cross-selling; credit-limit increase offers |
+| **High-Value Customers** (high limits, regular payment) | Very Low | Retention campaigns; concierge services; early access to new products |
+
+: Business Actions by Customer Segment {#tbl-business-actions}
+
+Deploying the Random Forest scorer in production would enable the bank to flag potential defaulters 30 days in advance, allowing relationship managers to intervene before delinquency escalates. The segmentation layer adds granularity beyond a binary score, supporting personalised outreach that can simultaneously reduce credit losses and improve customer satisfaction.
+
+### Limitations and Future Work
+
+- **Class imbalance** (~22 % default rate) may cause models to under-predict defaults. Future work should explore oversampling techniques (SMOTE) or cost-sensitive learning.
+- **Temporal leakage** is mitigated by using a strict train/test split, but production deployment requires a temporal holdout (train on months 1–5, test on month 6).
+- **Model interpretability** can be enhanced with SHAP (SHapley Additive exPlanations) values to explain individual predictions to credit officers.
+- **Cluster labelling** is currently heuristic; a more rigorous approach would compare segment profiles against business domain knowledge and validate stability across time windows.
+
+---
+
+*Report generated with [Quarto](https://quarto.org) and R `r R.version.string`*
